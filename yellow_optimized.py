@@ -250,6 +250,7 @@ _greedy_state = {}  # pattern-tuple -> word that covers it
 _greedy_counter = defaultdict(int)  # how many times we reused a covering word
 
 
+# https://en.wikipedia.org/wiki/Set_cover_problem
 def find_words_for_pattern_greedy(
     target, pattern, wordlist, pattern_groups, letter_pos_index
 ):
