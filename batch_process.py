@@ -270,6 +270,8 @@ def create_video_with_ffmpeg(
             str(actual_fps),
             "-i",
             str(input_pattern),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # Ensure even dimensions
             "-c:v",
             "libx264",
             "-pix_fmt",

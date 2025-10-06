@@ -242,6 +242,54 @@ def build_pattern_index_optimized(wordlist):
     return pattern_groups, letter_position_index
 
 
+# ------------------------------------------------------------------
+#  GREEDY-SET-COVER word picker
+# ------------------------------------------------------------------
+# private to this module – one dict per worker process
+_greedy_state = {}  # pattern-tuple -> word that covers it
+_greedy_counter = defaultdict(int)  # how many times we reused a covering word
+
+
+def find_words_for_pattern_greedy(
+    target, pattern, wordlist, pattern_groups, letter_pos_index
+):
+    """
+    Greedy-set-cover variant:
+    1. if we already chose a word for this pattern → return it immediately
+    2. otherwise pick the *first* word that produces the pattern (cheap)
+    3. store the choice so every future identical pattern reuses the word
+    """
+    pat = tuple(pattern)
+
+    # 1.  already covered by earlier greedy choice
+    if pat in _greedy_state:
+        _greedy_counter[pat] += 1
+        return [_greedy_state[pat]]
+
+    # 2.  fall back to the original optimised scanner
+    candidates = find_words_for_pattern_greedy(
+        target, desired_pat, wordlist, pattern_groups, letter_position_index
+    )
+
+    # 3.  first word becomes the permanent covering set for this pattern
+    if candidates:
+        word = candidates[0]
+        _greedy_state[pat] = word
+        return [word]
+
+    # 4.  no exact match → use old approximate fallback
+    return []
+
+
+# ------------------------------------------------------------------
+#  optional: diagnostics
+# ------------------------------------------------------------------
+def greedy_stats():
+    total = sum(_greedy_counter.values())
+    unique = len(_greedy_state)
+    return {"greedy_hits": total, "unique_patterns_covered": unique}
+
+
 def find_words_for_pattern_optimized(
     target, pattern, wordlist, pattern_groups, letter_position_index
 ):
@@ -252,7 +300,7 @@ def find_words_for_pattern_optimized(
     green_positions = {}
     yellow_letters = {}
     black_positions = set()
-
+    pat = tuple(pattern)
     for i, p in enumerate(pattern):
         if p == 2:  # Green
             green_positions[i] = target[i]
@@ -293,7 +341,15 @@ def find_words_for_pattern_optimized(
             if feedback(word, target) == pattern:
                 valid_candidates.append(word)
 
-    return valid_candidates
+        # ----------  HYBRID HOOK  ----------
+        if len(valid_candidates) == 0 and not _preindex_ready.is_set():
+            # trigger lazy build once we are “close” to threshold
+            if len(_pattern_cache) >= _PREINDEX_THRESHOLD:
+                _maybe_build_preindex(target, wordlist)
+                # retry with pre-index
+                if pat in _preindex_map and _preindex_map[pat]:
+                    return _preindex_map[pat]
+        return valid_candidates
 
 
 def _quick_validate_word(
@@ -350,7 +406,7 @@ def solve_block_batch_optimized(block_batch):
                 desired_pat = block[r].tolist()
 
                 # Find candidates using optimized search
-                candidates = find_words_for_pattern_optimized(
+                candidates = _fast_lookup(
                     target, desired_pat, wordlist, pattern_groups, letter_position_index
                 )
 
@@ -1042,4 +1098,71 @@ if __name__ == "__main__":
         not args.quiet,
         take_screenshot_flag=not args.no_screenshot,
         screenshot_workers=args.screenshot_workers,
+    )
+
+# ------------------------------------------------------------------
+#  HYBRID PRE-INDEX  (lazy, shared across batches)
+# ------------------------------------------------------------------
+_PREINDEX_PATH = None  # set later when target_word is known
+_preindex_ready = threading.Event()  # flipped when file is ready
+_preindex_map = {}  # pattern-tuple -> list[word]
+
+_PREINDEX_THRESHOLD = 8_000  # build after LRU saw 8 k unique guesses
+
+
+def _get_preindex_path(target_word):
+    """Get the preindex file path for the given target word."""
+    return CACHE_DIR / f"preindex_{target_word.lower()}.json"
+
+
+def _maybe_build_preindex(target: str, wordlist: list[str]):
+    """Called inside the LRU path once threshold is crossed."""
+    global _preindex_map
+    if _preindex_ready.is_set():  # already built
+        return
+    preindex_path = _get_preindex_path(target)
+    with _cache_file_lock:  # one builder
+        if preindex_path.exists():  # another worker built it
+            _load_preindex(target)
+            return
+        try:
+            if verbose:
+                print("[hybrid] building pre-index …")
+        except NameError:
+            print("[hybrid] building pre-index …")
+        tmp = defaultdict(list)
+        for w in wordlist:
+            tmp[tuple(feedback(w, target))].append(w)
+        # atomic write
+        preindex_path.write_text(
+            json.dumps({",".join(map(str, k)): v for k, v in tmp.items()})
+        )
+        _load_preindex(target)
+
+
+def _load_preindex(target_word):
+    """Lightning-fast load: pure dict, no pickle."""
+    global _preindex_map
+    preindex_path = _get_preindex_path(target_word)
+    raw = json.loads(preindex_path.read_text())
+    _preindex_map = {tuple(map(int, k.split(","))): v for k, v in raw.items()}
+    _preindex_ready.set()
+    print(f"[hybrid] pre-index ready ({len(_preindex_map)} patterns)")
+
+
+def _fast_lookup(
+    target: str,
+    pattern: tuple,
+    wordlist: list[str],
+    pattern_groups,
+    letter_position_index,
+):
+    """LRU → pre-index → fallback scan."""
+    # 1.  LRU hit  (O(1))
+    pat = tuple(pattern)
+    if pat in _preindex_map and _preindex_map[pat]:
+        return _preindex_map[pat][0]
+    # 2.  still not ready → scan like before
+    return find_words_for_pattern_optimized(
+        target, pattern, wordlist, pattern_groups, letter_position_index
     )
